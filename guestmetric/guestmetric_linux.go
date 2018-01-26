@@ -75,14 +75,14 @@ func (c *Collector) CollectMemory() (GuestMetric, error) {
 	return prefixKeys("data/", current), nil
 }
 
-func EnumNetworkAddresses(iface string) (GuestMetric, error) {
+func enumNetworkAddresses(iface string) (GuestMetric, error) {
 	const (
 		IP_RE   string = `(\d{1,3}\.){3}\d{1,3}`
 		IPV6_RE string = `[\da-f:]+[\da-f]`
 	)
 
 	var (
-		IP_IPV4_ADDR_RE       = regexp.MustCompile(`inet\s*(` + IP_RE + `).*\se[a-zA-Z0-9]+\s`)
+		IP_IPV4_ADDR_RE       = regexp.MustCompile(`inet\s*(` + IP_RE + `).*\se[a-zA-Z0-9]+[\s\n]`)
 		IP_IPV6_ADDR_RE       = regexp.MustCompile(`inet6\s*(` + IPV6_RE + `)`)
 		IFCONFIG_IPV4_ADDR_RE = regexp.MustCompile(`inet addr:\s*(` + IP_RE + `)`)
 		IFCONFIG_IPV6_ADDR_RE = regexp.MustCompile(`inet6 addr:\s*(` + IPV6_RE + `)`)
@@ -105,32 +105,94 @@ func EnumNetworkAddresses(iface string) (GuestMetric, error) {
 
 	m := v4re.FindAllStringSubmatch(out, -1)
 	if m != nil {
-		for _, parts := range m {
-			d["ip"] = parts[1]
+		for i, parts := range m {
+			d[fmt.Sprintf("ipv4/%d", i)] = parts[1]
 		}
 	}
 	m = v6re.FindAllStringSubmatch(out, -1)
 	if m != nil {
 		for i, parts := range m {
-			d[fmt.Sprintf("ipv6/%d/addr", i)] = parts[1]
+			d[fmt.Sprintf("ipv6/%d", i)] = parts[1]
 		}
 	}
+
 	return d, nil
+}
+
+func getVifIdfromNodename(path string) (string, error) {
+	nodenamePath := fmt.Sprintf("%s/device/nodename", path)
+	strLine, err := readSysfs(nodenamePath)
+	if err != nil {
+		return "", err
+	}
+	vifId := ""
+	reNodename := regexp.MustCompile(`^device\/vif\/(\d+)$`)
+	if matched := reNodename.FindStringSubmatch(strLine); matched != nil {
+		vifId = matched[1]
+	}
+	if vifId == "" {
+		return "", fmt.Errorf("Not found string like \"device/vif/[id]\" in file %s", nodenamePath)
+	} else {
+		return vifId, nil
+	}
+}
+func (c *Collector) getVifIdfromMacaddressMapping(path string) (string, error) {
+	macAddress, err := readSysfs(path + "/address")
+	if err != nil {
+		return "", err
+	}
+	subPaths, err := c.Client.List("device/vif")
+	if err != nil {
+		return "", err
+	}
+	for _, subPath := range subPaths {
+		iterMac, err := c.Client.Read(fmt.Sprintf("device/vif/%s/mac", subPath))
+		if err != nil {
+			continue
+		}
+		if iterMac == macAddress {
+			return subPath, nil
+		}
+	}
+	return "", fmt.Errorf("Cannot find a mac address to map with")
+}
+
+func (c *Collector) getVifId(path string) (string, error) {
+	// try to get vif_id from nodename interface, only a plain vif have nodename interface.
+	vifId, err1 := getVifIdfromNodename(path)
+	if vifId != "" {
+		return vifId, nil
+	}
+	// not a plain vif, it could possible be a SRIOV vif, try to get vif id from mac address
+	vifId, err2 := c.getVifIdfromMacaddressMapping(path)
+	if vifId != "" {
+		return vifId, nil
+	}
+	return "", fmt.Errorf("Cannot get vifId, errors: %s | %s", err1.Error(), err2.Error())
 }
 
 func (c *Collector) CollectNetworkAddr() (GuestMetric, error) {
 	current := make(GuestMetric, 0)
 
-	paths, err := filepath.Glob("/sys/class/net/e*")
-	if err != nil {
-		return nil, err
+	var paths []string
+	vifNamePrefixList := [...]string{"eth", "eno", "ens", "emp", "enx"}
+	for _, prefix := range vifNamePrefixList {
+		prefixPaths, err := filepath.Glob(fmt.Sprintf("/sys/class/net/%s*", prefix))
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, prefixPaths...)
 	}
-
 	for _, path := range paths {
+		// a path is going to be like "/sys/class/net/eth0"
+		vifId, err := c.getVifId(path)
+		if err != nil {
+			continue
+		}
 		iface := filepath.Base(path)
-		if addrs, err := EnumNetworkAddresses(iface); err == nil {
+		if addrs, err := enumNetworkAddresses(iface); err == nil {
 			for tag, addr := range addrs {
-				current[fmt.Sprintf("%s/%s", iface, tag)] = addr
+				current[fmt.Sprintf("vif/%s/%s", vifId, tag)] = addr
 			}
 		}
 	}
@@ -189,16 +251,15 @@ func (c *Collector) CollectDisk() (GuestMetric, error) {
 			real_dev := ""
 			if c.Client != nil {
 				nodename, err := readSysfs(fmt.Sprintf("/sys/block/%s/device/nodename", disk))
-				if err != nil {
-					return nil, err
-				}
-				backend, err := c.Client.Read(fmt.Sprintf("%s/backend", nodename))
-				if err != nil {
-					return nil, err
-				}
-				real_dev, err = c.Client.Read(fmt.Sprintf("%s/dev", backend))
-				if err != nil {
-					return nil, err
+				if err == nil {
+					backend, err := c.Client.Read(fmt.Sprintf("%s/backend", nodename))
+					if err != nil {
+						return nil, err
+					}
+					real_dev, err = c.Client.Read(fmt.Sprintf("%s/dev", backend))
+					if err != nil {
+						return nil, err
+					}
 				}
 			}
 			name := path

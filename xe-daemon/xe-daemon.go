@@ -4,6 +4,7 @@ import (
 	feature "../feature"
 	guestmetric "../guestmetric"
 	syslog "../syslog"
+	system "../system"
 	xenstoreclient "../xenstoreclient"
 	"flag"
 	"fmt"
@@ -18,7 +19,10 @@ import (
 )
 
 const (
-	LoggerName string = "xe-daemon"
+	LoggerName           string = "xe-daemon"
+	DivisorOne           int    = 1
+	DivisorTwo           int    = 2
+	DivisorLeastMultiple int    = 2 // The least common multiple, ensure every collector done before executing InvalidCacheFlush.
 )
 
 func main() {
@@ -53,6 +57,9 @@ func main() {
 	exitChannel := make(chan os.Signal, 1)
 	signal.Notify(exitChannel, syscall.SIGTERM, syscall.SIGINT)
 
+	resumedChannel := make(chan int)
+	go system.NotifyResumed(resumedChannel)
+
 	xs, err := xenstoreclient.NewCachedXenstore(0)
 	if err != nil {
 		message := fmt.Sprintf("NewCachedXenstore error: %v\n", err)
@@ -72,11 +79,11 @@ func main() {
 		name    string
 		Collect func() (guestmetric.GuestMetric, error)
 	}{
-		{1, "CollectOS", collector.CollectOS},
-		{1, "CollectMisc", collector.CollectMisc},
-		{1, "CollectNetworkAddr", collector.CollectNetworkAddr},
-		{1, "CollectDisk", collector.CollectDisk},
-		{2, "CollectMemory", collector.CollectMemory},
+		{DivisorOne, "CollectOS", collector.CollectOS},
+		{DivisorOne, "CollectMisc", collector.CollectMisc},
+		{DivisorOne, "CollectNetworkAddr", collector.CollectNetworkAddr},
+		{DivisorOne, "CollectDisk", collector.CollectDisk},
+		{DivisorTwo, "CollectMemory", collector.CollectMemory},
 	}
 
 	lastUniqueID, err := xs.Read("unique-domain-id")
@@ -113,7 +120,9 @@ func main() {
 		updated := false
 		for _, collector := range collectors {
 			if count%collector.divisor == 0 {
-				logger.Printf("Running %s ...\n", collector.name)
+				if *debugFlag {
+					logger.Printf("Running %s ...\n", collector.name)
+				}
 				result, err := collector.Collect()
 				if err != nil {
 					logger.Printf("%s error: %#v\n", collector.name, err)
@@ -132,6 +141,14 @@ func main() {
 				}
 			}
 		}
+		if count%DivisorLeastMultiple == 0 {
+			if cx, ok := xs.(*xenstoreclient.CachedXenStore); ok {
+				err := cx.InvalidCacheFlush()
+				if err != nil {
+					logger.Printf("InvalidCacheFlush error: %#v\n", err)
+				}
+			}
+		}
 
 		if updated {
 			xs.Write("data/updated", time.Now().Format("Mon Jan _2 15:04:05 2006"))
@@ -146,6 +163,10 @@ func main() {
 				}
 			}
 			return
+
+		case <-resumedChannel:
+			logger.Printf("Trigger refresh after system resume\n")
+			continue
 
 		case <-time.After(time.Duration(*sleepInterval) * time.Second):
 			continue

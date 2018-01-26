@@ -63,6 +63,7 @@ type XenStoreClient interface {
 	Close() error
 	DO(packet *Packet) (*Packet, error)
 	Read(path string) (string, error)
+	List(path string) ([]string, error)
 	Mkdir(path string) error
 	Rm(path string) error
 	Write(path string, value string) error
@@ -320,7 +321,7 @@ func (xs *XenStore) Read(path string) (string, error) {
 	return string(resp.Value), nil
 }
 
-func (xs *XenStore) Directory(path string) (string, error) {
+func (xs *XenStore) List(path string) ([]string, error) {
 	v := []byte(path + "\x00")
 	req := &Packet{
 		OpCode: XS_DIRECTORY,
@@ -331,9 +332,12 @@ func (xs *XenStore) Directory(path string) (string, error) {
 	}
 	resp, err := xs.DO(req)
 	if err != nil {
-		return "", err
+		return []string{}, err
 	}
-	return string(resp.Value), nil
+	subItems := strings.Split(
+		string(bytes.Trim(resp.Value, "\x00")), "\x00")
+
+	return subItems, nil
 }
 
 func (xs *XenStore) Mkdir(path string) error {
@@ -520,9 +524,14 @@ func (xs *XenStore) StopWatch() error {
 	return nil
 }
 
+type Content struct {
+	value     string
+	keepalive bool
+}
+
 type CachedXenStore struct {
 	xs         XenStoreClient
-	writeCache map[string]string
+	writeCache map[string]Content
 }
 
 func NewCachedXenstore(tx uint32) (XenStoreClient, error) {
@@ -532,17 +541,19 @@ func NewCachedXenstore(tx uint32) (XenStoreClient, error) {
 	}
 	return &CachedXenStore{
 		xs:         xs,
-		writeCache: make(map[string]string, 0),
+		writeCache: make(map[string]Content, 0),
 	}, nil
 }
 
 func (xs *CachedXenStore) Write(path string, value string) error {
-	if v, ok := xs.writeCache[path]; ok && v == value {
+	if v, ok := xs.writeCache[path]; ok && v.value == value {
+		v.keepalive = true
+		xs.writeCache[path] = v
 		return nil
 	}
 	err := xs.xs.Write(path, value)
 	if err == nil {
-		xs.writeCache[path] = value
+		xs.writeCache[path] = Content{value: value, keepalive: true}
 	}
 	return err
 }
@@ -561,6 +572,8 @@ func (xs *CachedXenStore) Read(path string) (string, error) {
 
 func (xs *CachedXenStore) Directory(path string) (string, error) {
 	return xs.xs.Directory(path)
+func (xs *CachedXenStore) List(path string) ([]string, error) {
+	return xs.xs.List(path)
 }
 
 func (xs *CachedXenStore) Mkdir(path string) error {
@@ -592,7 +605,24 @@ func (xs *CachedXenStore) StopWatch() error {
 }
 
 func (xs *CachedXenStore) Clear() {
-	xs.writeCache = make(map[string]string, 0)
+	xs.writeCache = make(map[string]Content, 0)
+}
+
+func (xs *CachedXenStore) InvalidCacheFlush() error {
+	for key, value := range xs.writeCache {
+		if value.keepalive {
+			value.keepalive = false
+			xs.writeCache[key] = value
+		} else {
+			err := xs.Rm(key)
+			if err != nil {
+				return err
+			} else {
+				delete(xs.writeCache, key)
+			}
+		}
+	}
+	return nil
 }
 
 func getDevPath() (devPath string, getDevPath bool, err error) {
