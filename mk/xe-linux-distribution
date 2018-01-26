@@ -433,6 +433,7 @@ identify_yinhe()
     write_to_output "${distro}" "${major}" "${minor}" "${yinhe_osname}"
 }
 
+
 identify_boot2docker()
 {
     boot2docker_release="$1"
